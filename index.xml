@@ -1,0 +1,866 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?><rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom"><channel><title>朝花夕拾</title><link>http://yeya24.github.io/</link><description>Recent content on 朝花夕拾</description><generator>Hugo -- gohugo.io</generator><language>en</language><lastBuildDate>Fri, 06 Nov 2020 15:24:27 -0500</lastBuildDate><atom:link href="http://yeya24.github.io/index.xml" rel="self" type="application/rss+xml"/><item><title>Conprof: Like Prometheus, but for profiles</title><link>http://yeya24.github.io/post/conprof/</link><pubDate>Fri, 06 Nov 2020 15:24:27 -0500</pubDate><guid>http://yeya24.github.io/post/conprof/</guid><description>&lt;p>Conprof 是一个对应用程序进行持续 profilling 的系统，它基于https://research.google/pubs/pub36575/。Conprof 目前已经在我们组生产环境的集群上稳定运行了几个月了，并且能够在 debug 线上集群问题方面提供非常大的帮助。 据我所知，Conprof 最早亮相于 KubeCon EU 2019 的 Keynote 演讲上。Conprof 的主要作者 Frederic 和 Grafana 的 VP Tom 分享了 Observability 的未来趋势，当时他们预测了三点，很有趣的是，这三点在 2020 年底来看，基本已经成为现实：&lt;/p>
+&lt;ul>
+&lt;li>More correlation between the three pillars (monitoring, logging and tracing)&lt;/li>
+&lt;li>New signals and new analysis&lt;/li>
+&lt;li>Rise of index free log aggregation&lt;/li>
+&lt;/ul>
+&lt;p>先聊聊第三点。Index free log aggregation 的服务，主要指的就是 Grafana Loki。以往我们在日志的解决方案上通常采用 EFK 来收集、索引以及查询日志，但是这真的有必要吗？很多时候我们并不需要建立那么多的索引，我们只需要类似 grep 那样的功能来对日志进行查询。就这有了 Loki，它并不像 ES 一样需要你自己管理索引，而是采用 Prometheus 一样的 labels 机制来索引日志。这一点在 Kubernetes 的场景下尤为重要，因为这也就意味着 每个 Pod 的监控指标和日志被相同的 labels 元数据信息给串联了起来。&lt;/p>
+&lt;p>再来说第一点，在日前结束的 ObservabilityCon 上， Grafana 演示了一个 demo 来展示 他们如何打通 metrics，logs，traces。首先在查询 Loki 的日志，可以找到每个请求的 trace ID。通过 trace ID 可以唯一识别一个 trace， 从而跳转到 Trace 的 UI 进行查询。&lt;/p>
+&lt;p>在 metrics 与 trace 的结合上，主要是采用 exemplars 的机制在 metrics 中加带上额外的 label pairs。Prometheus 在收集 metrics 的时候也会收集这些数据并存储下来，而在查询的时候通过一个单独的 API 来暴露 exemplars 信息。借用这种机制，我们可以把 trace ID 作为一个 label pair 加入 exemplar 中，从而可以从 Prometheus 中查询到 trace 的信息。&lt;/p>
+&lt;p>好的，感觉扯的有点远了。最后讲讲今天的主题，第二点中的 new signals，指的就是 profiles。pprof 目前已经在 Go 的生态中被广泛运用，而在其他语言上也有 pprof 的实现，例如 pprof-rs。Profiles 可以帮助我们分析，观察程序的运行性能，包括 CPU，内存（heap），goroutine 等等。从CPU profiles的函数调用耗时中，我们可以很直观的定位到程序当前的瓶颈。&lt;/p>
+&lt;p>profiles 与 metrics 类似，都是通过 HTTP 端点进行暴露。那么如果像 Prometheus 一样，每隔一段时间定期去抓取程序的 profiles 并存储在 TSDB 中，后续出现问题了再去查询那个时间段的 profiles，就能够很方便地定位到问题了，这就是 Conprof。&lt;/p>
+&lt;p>Conprof 本质上就是与 Prometheus 一样的系统，可以通过一个二进制文件直接运行。不过为了更好的可扩展性，它也支持微服务模式来更好的支持横向扩展。它将内部的组件分成了三个部分，并通过 gRPC 进行通信。主要的组件包括：&lt;/p>
+&lt;ol>
+&lt;li>Sampler&lt;/li>
+&lt;li>Store&lt;/li>
+&lt;li>API&lt;/li>
+&lt;/ol>
+&lt;p>Sampler 是数据的写入部分，它直接使用了 Prometheus 的服务发现模块来发现 targets，定期对他们进行 Profiling，并将结果的 protobuf 压缩后，通过gRPC API存储到 TSDB 中。&lt;/p>
+&lt;p>Store 就是一个 gRPC 封装起来的 TSDB。Conprof 的 TSDB 是一个 fork 版本的 Prometheus TSDB。它与上游的 TSDB 基本一样，唯一的区别就是 Conprof 里面 sample 的值是 []byte, 而 Prometheus sample 的值是 float64，这也导致了 Prometheus 中的数据可以应用 Gorilla paper 中的方式进行压缩存储，而 Conprof 不行，所以在内存和磁盘使用量上目前还是会高于 Prometheus。&lt;/p>
+&lt;p>最后是 API 也就是 Query 组件。它对外暴露了类似于 Prometheus 的 API，包括 &lt;code>query&lt;/code>, &lt;code>label_names&lt;/code>, &lt;code>label_values&lt;/code>, &lt;code>series&lt;/code> 等等，它也包括一个非常基本的 web UI 来查询 profiles。&lt;/p>
+&lt;p>不过目前来说这个 UI 来处于非常初级的阶段，如果想要将 Conprof 与 Grafana 更好的集成，可以看看这个为 Grafana 实现的 Conprof 数据源，用来在 Grafana上通过 annotations 来展示 profiles &lt;a href="https://github.com/yeya24/conprof-datasource">https://github.com/yeya24/conprof-datasource&lt;/a> 。&lt;/p>
+&lt;p>未来？&lt;/p></description></item><item><title>使用kubeadm安装k8s 1.16.3</title><link>http://yeya24.github.io/post/install-k8s/</link><pubDate>Sat, 06 Apr 2019 16:15:35 +0800</pubDate><guid>http://yeya24.github.io/post/install-k8s/</guid><description>&lt;p>至少使用2台节点，当然最好3台，每台资源达到4核8G，所使用的环境在Centos 7.5版本及以上&lt;/p>
+&lt;p>事先准备：给每台节点改主机名称，在k8s中需要每一台机器有一个独特的主机名，在centos里面使用hostnamectl这个工具来更改&lt;/p>
+&lt;pre>&lt;code>hostnamectl set-hostname xxx
+reboot -n # 这一步是重启
+&lt;/code>&lt;/pre>&lt;p>安装docker，安装完成之后自行检查docker ps 或者docker run检查安装情况&lt;/p>
+&lt;pre>&lt;code>yum update -y
+yum install -y yum-utils
+yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+yum makecache fast
+yum install -y docker-ce
+systemctl enable docker
+systemctl restart docker
+&lt;/code>&lt;/pre>&lt;p>在每台机器上运行下面的一个脚本，具体方法是创建一个setting.sh文件 chmod +x setting.sh 将脚本的内容复制进去，后运行脚本即可&lt;/p>
+&lt;pre>&lt;code>#!/bin/sh
+# 关闭防火墙
+systemctl stop firewalld &amp;amp;&amp;amp; systemctl disable firewalld
+# 关闭selinux
+setenforce 0
+sed -i 's/SELINUX=enforcing/SELINUX=disabled/g' /etc/selinux/config
+# 关闭交换分区
+swapoff -a &amp;amp;&amp;amp; sysctl -w vm.swappiness=0
+sed '/swap.img/d' -i /etc/fstab
+# 添加阿里云的k8s源
+cat &amp;lt;&amp;lt;EOF &amp;gt; /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=http://mirrors.aliyun.com/kubernetes/yum/repos/kubernetes-el7-x86_64
+enabled=1
+gpgcheck=0
+repo_gpgcheck=0
+gpgkey=http://mirrors.aliyun.com/kubernetes/yum/doc/yum-key.gpg
+http://mirrors.aliyun.com/kubernetes/yum/doc/rpm-package-key.gpg
+EOF
+# 添加需要用到的内核网络参数
+cat &amp;lt;&amp;lt;EOF | tee /etc/sysctl.d/k8s.conf
+net.ipv4.ip_forward = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+EOF
+sysctl -p /etc/sysctl.d/k8s.conf
+&lt;/code>&lt;/pre>&lt;p>每台机器执行完上面的脚本之后，再创建一个脚本 image.sh，将以下内容复制进去，之后 chmod +x image.sh这个脚本以后可以用来拉取镜像&lt;/p>
+&lt;pre>&lt;code>#!/bin/sh
+curl -s https://zhangguanzhang.github.io/bash/pull.sh | bash -s -- $1
+&lt;/code>&lt;/pre>&lt;p>接下来如果是master节点，创建一个install-master.sh脚本并运行&lt;/p>
+&lt;pre>&lt;code>#!/bin/sh
+version=1.16.3
+yum install -y kubelet-$version
+yum install -y kubectl-$version kubeadm-$version
+systemctl enable kubelet
+systemctl restart kubelet
+cat &amp;lt;&amp;lt;EOF &amp;gt; ~/kubeadm.conf
+apiVersion: kubeadm.k8s.io/v1beta1
+kind: ClusterConfiguration
+networking:
+podSubnet: &amp;quot;192.168.0.0/16&amp;quot;
+kubernetesVersion: &amp;quot;v1.16.3&amp;quot;
+EOF
+~/image.sh k8s.gcr.io/kube-controller-manager:v$version
+~/image.sh k8s.gcr.io/kube-proxy:v$version
+~/image.sh k8s.gcr.io/kube-apiserver:v$version
+~/image.sh k8s.gcr.io/kube-scheduler:v$version
+~/image.sh k8s.gcr.io/kubernetes-dashboard-amd64:v1.10.1
+~/image.sh k8s.gcr.io/coredns:1.6.2
+~/image.sh k8s.gcr.io/etcd:3.3.15-0
+~/image.sh k8s.gcr.io/pause:3.1
+docker pull calico/node:v3.10.1
+docker pull calico/cni:v3.10.1
+docker pull calico/kube-controllers:v3.10.1
+docker pull calico/pod2daemon-flexvol:v3.10.1
+&lt;/code>&lt;/pre>&lt;p>这里有一个地方需要注意一下，如果创建的机器在公有云上，我们需要添加上公有云机器的弹性公网ip，这样本地的kubectl就可以修改kubeconfig访问到公有云master节点的6443端口，这个时候可以在kubeadm.conf的配置文件中进行如下的修改&lt;/p>
+&lt;pre>&lt;code>apiVersion: kubeadm.k8s.io/v1beta1
+kind: ClusterConfiguration
+apiServer:
+certSANs:
+- 这里填写你需要暴露的公网ip地址
+networking:
+podSubnet: &amp;quot;192.168.0.0/16&amp;quot;
+kubernetesVersion: &amp;quot;v1.16.3&amp;quot;
+&lt;/code>&lt;/pre>&lt;p>如果是node，创建一个install-node.sh脚本并运行&lt;/p>
+&lt;pre>&lt;code>#!/bin/sh
+version=1.16.3
+yum install -y kubelet-$version
+yum install -y kubeadm-$version
+systemctl enable kubelet
+systemctl restart kubelet
+~/image.sh k8s.gcr.io/kube-proxy:v$version
+~/image.sh k8s.gcr.io/kubernetes-dashboard-amd64:v1.10.1
+~/image.sh k8s.gcr.io/coredns:1.6.2
+~/image.sh k8s.gcr.io/pause:3.1
+docker pull calico/node:v3.10.1
+docker pull calico/cni:v3.10.1
+docker pull calico/kube-controllers:v3.10.1
+docker pull calico/pod2daemon-flexvol:v3.10.1
+&lt;/code>&lt;/pre>&lt;p>等待每个节点上面的脚本都执行完成之后，在master节点上运行下面的命令正式开始安装&lt;/p>
+&lt;pre>&lt;code>kubeadm init --config kubeadm.conf
+&lt;/code>&lt;/pre>&lt;p>当出现运行成功的字样之后，执行命令&lt;/p>
+&lt;pre>&lt;code>mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+&lt;/code>&lt;/pre>&lt;p>然后在node节点上面执行安装完成后跳出来的命令
+以下面的这行命令为例，在master节点上安装完成之后下面会显示出类似的这么一条命令，你只要复制下来在node节点上运行一下即可（下面的只是个示例）&lt;/p>
+&lt;pre>&lt;code>kubeadm join 10.14.10.139:6443 --token zxqopw.kkoe6hduf6113pmn --discovery-token-ca-cert-hash sha256:42de13e61ba1d1647b4f9b21fcf05964b826f84df0db41f87c0b66fb48bb2d32
+&lt;/code>&lt;/pre>&lt;p>最后的步骤是安装calico，calico是我这边选择的网络组件，下面的命令都在master上面执行&lt;/p>
+&lt;pre>&lt;code>kubectl taint node k8s-m1 node-role.kubernetes.io/master- # 这一步是去除master上面的污点，这个地方要注意，将我前面的 k8s-m1 换成你那边对应的master节点的名称，实际情况下这步可以不用执行，非必须。
+wget https://docs.projectcalico.org/v3.10/manifests/calico.yaml
+kubectl apply -f calico.yaml
+&lt;/code>&lt;/pre>&lt;p>可以通过kubectl get nodes 查看状态，一般来说出现下面的状态就是都ok了，如果不ok，一般来说可能是网络插件还没启动或者运行出错。&lt;/p>
+&lt;pre>&lt;code>NAME STATUS ROLES AGE VERSION
+k8s-m1 Ready master 4d23h v1.16.3
+k8s-m2 Ready &amp;lt;none&amp;gt; 4d23h v1.16.3
+k8s-m3 Ready &amp;lt;none&amp;gt; 4d23h v1.16.3
+&lt;/code>&lt;/pre></description></item><item><title>使用kind来快速部署k8s环境</title><link>http://yeya24.github.io/post/kind/</link><pubDate>Fri, 05 Apr 2019 10:23:15 +0800</pubDate><guid>http://yeya24.github.io/post/kind/</guid><description>&lt;h2 id="啥是kind">啥是kind&lt;/h2>
+&lt;p>&lt;a href="https://github.com/kubernetes-sigs/kind">kind&lt;/a> 即 Kubernetes In Docker，顾名思义，就是将 k8s 所需要的所有组件，全部部署在一个docker容器中，是一套开箱即用的 k8s 环境搭建方案。使用 kind 搭建的集群无法在生产中使用，但是如果你只是想在本地简单的玩玩 k8s，不想占用太多的资源，那么使用 kind 是你不错的选择。同样，kind 还可以很方便的帮你本地的 k8s 源代码打成对应的镜像，方便测试。&lt;/p>
+&lt;h2 id="使用kind">使用kind&lt;/h2>
+&lt;p>在学校的一台 centos 上简单尝试一下 kind，前提是必须要安装好 docker 和 kubectl。&lt;/p>
+&lt;pre>&lt;code>wget https://github.com/kubernetes-sigs/kind/releases/download/0.2.1/kind-linux-amd64
+mv kind-linux-amd64 kind
+chmod +x kind
+mv kind /usr/local/bin
+&lt;/code>&lt;/pre>&lt;p>安装完成之后，我们来看看 kind 有哪些命令。&lt;/p>
+&lt;p>build 用来从 k8s source 构建一个镜像。&lt;/p>
+&lt;p>create、delete 创建、删除集群。&lt;/p>
+&lt;p>export 命令目前只有一个 logs 选项，作用是将内部所有容器的日志拷贝到宿主机的某个目录下。&lt;/p>
+&lt;p>get 查看当前有哪些集群，哪些节点，以及 kubectl 配置文件的地址&lt;/p>
+&lt;p>load 可以从宿主机向 k8s 容器内导入镜像。&lt;/p>
+&lt;pre>&lt;code>[root@node-2 ~]# kind
+kind creates and manages local Kubernetes clusters using Docker container 'nodes'
+Usage:
+kind [command]
+Available Commands:
+build Build one of [base-image, node-image]
+create Creates one of [cluster]
+delete Deletes one of [cluster]
+export exports one of [logs]
+get Gets one of [clusters, nodes, kubeconfig-path]
+help Help about any command
+load Loads images into nodes
+version prints the kind CLI version
+Flags:
+-h, --help help for kind
+--loglevel string logrus log level [panic, fatal, error, warning, info, debug] (default &amp;quot;warning&amp;quot;)
+--version version for kind
+Use &amp;quot;kind [command] --help&amp;quot; for more information about a command.
+&lt;/code>&lt;/pre>&lt;p>下面来以最简单的方式安装一个集群&lt;/p>
+&lt;pre>&lt;code>[root@node-2 ~]# kind create cluster
+Creating cluster &amp;quot;kind&amp;quot; ...
+✓ Ensuring node image (kindest/node:v1.13.4) 🖼
+✓ Preparing nodes 📦
+✓ Creating kubeadm config 📜
+✓ Starting control-plane 🕹️
+Cluster creation complete. You can now use the cluster with:
+export KUBECONFIG=&amp;quot;$(kind get kubeconfig-path --name=&amp;quot;kind&amp;quot;)&amp;quot;
+kubectl cluster-info
+[root@node-2 ~]# export KUBECONFIG=&amp;quot;$(kind get kubeconfig-path --name=&amp;quot;kind&amp;quot;)&amp;quot;
+[root@node-2 ~]# kubectl cluster-info
+Kubernetes master is running at https://localhost:39284
+KubeDNS is running at https://localhost:39284/api/v1/namespaces/kube-system/services/kube-dns:dns/proxy
+To further debug and diagnose cluster problems, use 'kubectl cluster-info dump'.
+[root@node-2 ~]# kubectl get node
+NAME STATUS ROLES AGE VERSION
+kind-control-plane Ready master 99s v1.13.4
+&lt;/code>&lt;/pre>&lt;p>使用 &lt;strong>kind create cluster&lt;/strong> 安装，是没有指定任何配置文件的安装方式。从安装打印出的输出来看，分为4步：&lt;/p>
+&lt;ol>
+&lt;li>查看本地上是否存在一个基础的安装镜像，默认是 kindest/node:v1.13.4，这个镜像里面包含了需要安装的所有东西，包括了 kubectl、kubeadm、kubelet 二进制文件，以及安装对应版本 k8s 所需要的镜像，都以 tar 压缩包的形式放在镜像内的一个路径下&lt;/li>
+&lt;li>准备你的 node，这里就是做一些启动容器、解压镜像之类的工作&lt;/li>
+&lt;li>生成对应的 kubeadm 的配置，之后通过 kubeadm 安装，安装之后还会做另外的一些操作，比如像我刚才仅安装单节点的集群，会帮你删掉 master 节点上的污点，否则对于没有容忍的 pod 无法部署。&lt;/li>
+&lt;li>启动完毕&lt;/li>
+&lt;/ol>
+&lt;p>查看当前集群的运行情况&lt;/p>
+&lt;pre>&lt;code>[root@node-2 ~]# kubectl get po -n kube-system
+NAME READY STATUS RESTARTS AGE
+coredns-86c58d9df4-6g66f 1/1 Running 0 21m
+coredns-86c58d9df4-pqcc4 1/1 Running 0 21m
+etcd-kind-control-plane 1/1 Running 0 20m
+kube-apiserver-kind-control-plane 1/1 Running 0 20m
+kube-controller-manager-kind-control-plane 1/1 Running 0 20m
+kube-proxy-cjgnt 1/1 Running 0 21m
+kube-scheduler-kind-control-plane 1/1 Running 0 21m
+weave-net-ls2v8 2/2 Running 1 21m
+&lt;/code>&lt;/pre>&lt;p>默认方式启动的节点类型是 control-plane 类型，包含了所有的组件。包括2 * coredns、etcd、api-server、controller-manager、kube-proxy、sheduler，网络插件方面默认使用的是 weave，且目前只支持 weave，不支持其他配置，如果需要可以修改 kind 代码进行定制。&lt;/p>
+&lt;p>基本上，kind 的所有秘密都在那个基础镜像中。下面是基础容器内部的 /kind 目录，在 bin 目录下安装了 kubelet、kubeadm、kubectl 这些二进制文件，images 下面是镜像的 tar 包，kind 在启动基础镜像后会执行一遍 docker load 操作将这些 tar 包导入。manifests 下面是 weave 的 cni。&lt;/p>
+&lt;pre>&lt;code>root@kind-control-plane:/kind# ls
+bin images kubeadm.conf manifests systemd version
+root@kind-control-plane:/kind# ls bin/
+kubeadm kubectl kubelet
+root@kind-control-plane:/kind# ls images/
+4.tar 6.tar 8.tar kube-controller-manager.tar kube-scheduler.tar
+5.tar 7.tar kube-apiserver.tar kube-proxy.tar
+root@kind-control-plane:/kind# ls manifests/
+default-cni.yaml
+root@kind-control-plane:/kind# ls systemd/
+10-kubeadm.conf kubelet.service
+&lt;/code>&lt;/pre>&lt;h2 id="创建多节点的集群">创建多节点的集群&lt;/h2>
+&lt;p>默认安装的集群只带上了一个控制节点，下面重新创建一个两节点的集群。配置文件如下，在 node 中可以配置的不是很多，除了 role 另外的可以更改 node 使用的镜像，不过我这边还是使用默认的镜像。&lt;/p>
+&lt;pre>&lt;code>apiVersion: kind.sigs.k8s.io/v1alpha3
+kind: Cluster
+nodes:
+- role: control-plane
+- role: worker
+&lt;/code>&lt;/pre>&lt;p>还是使用命令安装&lt;/p>
+&lt;pre>&lt;code>[root@node-2 ~]# kind create cluster --config=kind-config.yaml
+Creating cluster &amp;quot;kind&amp;quot; ...
+✓ Ensuring node image (kindest/node:v1.13.4) 🖼
+✓ Preparing nodes 📦📦
+✓ Creating kubeadm config 📜
+✓ Starting control-plane 🕹️
+✓ Joining worker nodes 🚜
+Cluster creation complete. You can now use the cluster with:
+export KUBECONFIG=&amp;quot;$(kind get kubeconfig-path --name=&amp;quot;kind&amp;quot;)&amp;quot;
+kubectl cluster-info
+[root@node-2 ~]# kubectl get nodes
+NAME STATUS ROLES AGE VERSION
+kind-control-plane Ready master 3m20s v1.13.4
+kind-worker Ready &amp;lt;none&amp;gt; 3m8s v1.13.4
+[root@node-2 ~]# kubectl get po -n kube-system
+NAME READY STATUS RESTARTS AGE
+coredns-86c58d9df4-cnqhc 1/1 Running 0 5m29s
+coredns-86c58d9df4-hn9mv 1/1 Running 0 5m29s
+etcd-kind-control-plane 1/1 Running 0 4m24s
+kube-apiserver-kind-control-plane 1/1 Running 0 4m17s
+kube-controller-manager-kind-control-plane 1/1 Running 0 4m21s
+kube-proxy-8t4xt 1/1 Running 0 5m27s
+kube-proxy-skd5v 1/1 Running 0 5m29s
+kube-scheduler-kind-control-plane 1/1 Running 0 4m18s
+weave-net-nmfq2 2/2 Running 1 5m27s
+weave-net-srdfw 2/2 Running 0 5m29s
+&lt;/code>&lt;/pre>&lt;p>大功告成，一套测试集群很轻松就搭建完成啦。&lt;/p></description></item><item><title>GSoC 2019中的Prometheus相关项目介绍</title><link>http://yeya24.github.io/post/gsoc-prometheus-2019/</link><pubDate>Sun, 03 Mar 2019 13:34:50 +0800</pubDate><guid>http://yeya24.github.io/post/gsoc-prometheus-2019/</guid><description>&lt;p>中国时间3月1号凌晨，cncf 公布了2019年 GSoC 项目的 idea，具体的Github地址在 &lt;a href="https://github.com/cncf/soc">cncf/soc&lt;/a>。&lt;/p>
+&lt;p>简单看了一下里面的一些项目，在 k8s 的项目中，比较有意思的是 kube-batch 这个调度器与 pytorch-operator/mxnet-operator 的整合，这也是个与 kubeflow 紧密相关的项目。除此以外的 idea 很多与 k8s 的 CSI 以及 dashboard 相关。在 Prometheus 的 idea 中，感觉整体的有趣程度并不及去年，不过今年 cortex 也成为了 cncf 的沙箱项目，所以对 Prometheus 感兴趣的同学也可以选择去尝试完成 cortex 的项目。一直都对 Prometheus 比较感兴趣，这篇文章的主要内容就是来介绍一下19年 GSoC 里面与 Prometheus 相关的 idea 。&lt;/p>
+&lt;h1 id="prometheus">Prometheus&lt;/h1>
+&lt;p>Prometheus 是一个开源的监控报警系统。具体信息请参考官网：&lt;a href="https://prometheus.io/">https://prometheus.io/&lt;/a>&lt;/p>
+&lt;h2 id="benchmarks-for-tsdb">Benchmarks for TSDB&lt;/h2>
+&lt;ul>
+&lt;li>导师: Krasi Georgiev&lt;/li>
+&lt;li>技能: CI, Golang, Kubernetes&lt;/li>
+&lt;/ul>
+&lt;p>TSDB 是 Prometheus 底下的时序数据库，被放在一个单独的 repo 中，链接在 &lt;a href="https://github.com/prometheus/tsdb">prometheus/tsdb&lt;/a>。简而言之就是为 TSDB 写一个 benchmark，与 Prombench 项目类似。&lt;/p>
+&lt;h2 id="continue-the-work-on-prombench">Continue the work on Prombench&lt;/h2>
+&lt;ul>
+&lt;li>导师: Krasi Georgiev&lt;/li>
+&lt;li>技能: CI, Golang, Kubernetes, Grafana&lt;/li>
+&lt;/ul>
+&lt;p>Prombench 是18年的 GSoC 项目，包括了 Prometheus 的工作流中一整套的 benchmarks（不包括 TSDB）。 今年的工作是修复项目目前的一些可扩展性的问题，其实也就是帮忙修 bug 和做一些扩展。主要参考该 repo 下面的 &lt;a href="https://github.com/prometheus/prombench/issues">issues&lt;/a> ，优先修复高优先级的 issue，感觉就是去搬砖，没什么好说的。&lt;/p>
+&lt;h2 id="persist-retroactive-rule-reevaluations">Persist Retroactive Rule Reevaluations&lt;/h2>
+&lt;ul>
+&lt;li>导师: Ganesh Vernekar (@codesome), Goutham Veeramachaneni (@gouthamve)&lt;/li>
+&lt;li>技能: Golang&lt;/li>
+&lt;/ul>
+&lt;p>在 Prometheus 目前的 recording rule 中，有一个比较大的问题就是，一定要这个 recording rule 执行之后，TSDB 里面才会出现这个 metric。比如在 Grafana 中根据这个 metric 画图，一开始的一段时间你是看不到数据的，因为数据很少（一次 evaluation 的过程生成一个 metric）。这个 idea 的目的就是为了解决拿不到数据的问题，去对旧的数据进行查询来得到这个指定的 metric，使在 Grafana 里面能看到数据。另外，生成的 metrics 要求在 TSDB 中持久化一段时间。（不知道我有没有理解错意思，如果有误请指正）&lt;/p>
+&lt;p>这是比较老的一个 issue 了，相对来说我也感觉不是很高的优先级。不知道去年没完成的一些 idea 今年为啥不搞了，比如在 Prometheus 中支持慢查询我觉得就蛮有意义的。&lt;/p>
+&lt;p>参考地址：&lt;a href="https://github.com/prometheus/prometheus/issues/11">Persist Retroactive Rule Reevaluations&lt;/a>&lt;/p>
+&lt;h2 id="optimize-queries-using-regex-matchers-for-set-lookups">Optimize queries using regex matchers for set lookups&lt;/h2>
+&lt;ul>
+&lt;li>导师: Goutham Veeramachaneni (@gouthamve)&lt;/li>
+&lt;li>技能: Golang&lt;/li>
+&lt;/ul>
+&lt;p>通过 Prometheus 查询时序数据，通过正则匹配 labels 时，通常会出现需要同时匹配多个值的情况，在 Grafana 中这种 case 尤为常见。而目前在Prometheus 的 TSDB 中，对于正则匹配的 matcher 它的处理过程是拿到需要查询的 label 的所有的 value，然后依次进行正则匹配来筛选，很有可能出现效率问题，而这个 idea 的目的就是对这种正则匹配进行优化。比如说&lt;code>up{instance=~&amp;quot;foo|bar|baz&amp;quot;}&lt;/code>，如果需要优化可以将这种正则匹配转换成对 TSDB 的三次查询，变成 &lt;code>up{instance=&amp;quot;foo&amp;quot;}&lt;/code>、&lt;code>up{instance=&amp;quot;bar&amp;quot;}&lt;/code>、&lt;code>up{instance=&amp;quot;baz&amp;quot;}&lt;/code>，之后再将查询得到的 timeseries 进行聚合。当然这也只是作者给出的一个示例，实际上想做成什么样子可以自己实现。&lt;/p>
+&lt;p>在这个 &lt;a href="https://github.com/prometheus/prometheus/issues/2651">issue&lt;/a> 中作者也给出了 2 个实现的主要思路：&lt;/p>
+&lt;ul>
+&lt;li>通过 TSDB 自身来实现优化，我认为这也是比较合理的一种，针对 matcher 处理应该是 TSDB 本身的能力。&lt;/li>
+&lt;li>在 Prometheus 层面实现一个查询优化器，可以简单的类比于 MySQL 里面的 SQL Optimizer。用户进行 promql 查询之前，对用户输入的表达式进行优化。类似于这种 &lt;code>rate(requests{instance=~&amp;quot;foo|bar&amp;quot;}[1m])&lt;/code>，可以转化成 &lt;code>rate(requests{instance=&amp;quot;foo&amp;quot;}[1m]) OR rate(requests{instance=&amp;quot;bar&amp;quot;}[1m])&lt;/code>，将正则匹配中的或转化成了 promql 里的 or。&lt;/li>
+&lt;/ul>
+&lt;p>这个 idea 的话应该比较理想的实现方式是第一种，TSDB 的代码不多，涉及查询的那一部分的逻辑也比较清楚，不过这个小 feature 优先级不高，也不涉及 Prometheus 的核心能力，更多是对于 Grafana 查询 Prometheus 这个 case 下提供的一种优化。&lt;/p>
+&lt;h2 id="package-for-bulk-imports">Package for bulk imports&lt;/h2>
+&lt;ul>
+&lt;li>导师: Ganesh Vernekar (@codesome)&lt;/li>
+&lt;li>技能: Golang&lt;/li>
+&lt;/ul>
+&lt;p>感觉是今年的 idea 里面最有用的一个 feature 了，不过感觉做起来也比较费力，目的主要是为 Prometheus 实现数据批量上传的 API。上传的数据包括 Prometheus 的数据以及非 Prometheus 的数据（如 OpenTSDB、Influxdb）。这个 idea 有很大的 usecase：&lt;/p>
+&lt;ul>
+&lt;li>实现了批量上传之后，可以说更方便做 backup 了。监控的 metrics 数据可以另外做备份，需要时可以通过诸如 promtool 通过批量导入的 API 将数据载入 Prometheus，有点像 etcdctl 的 backup、restore。&lt;/li>
+&lt;li>更加方便做测试。比如你需要得到一些生产中的 metrics，然后根据它们来写一些报警规则或者测试 Grafana 的 dashboard。不过你只有你本地的 PC 的环境，没办法去连生产环境的 Prometheus，那么数据从哪里来？如果有批量导入数据可以很轻松的解决这个问题。&lt;/li>
+&lt;li>更加方便其他监控系统的用户转向 Promethues。如果你以前采用的是某个监控系统，比如 Influxdb、OpenTSDB，如果你想转而采用 Prometheus，那么对不起一切从零开始。如果批量上传的 API 能够对接其他系统的数据的话，那迁移其实就非常方便了。&lt;/li>
+&lt;/ul>
+&lt;p>这个 idea 工作量感觉还是蛮大的，目前的情况下在 TSDB 那边刚刚 merge 了一个 vertical querier 的实现，能够支持读取时序有覆盖的数据块里面的数据，有了这个 feature，稍微减少了一些工作量。值得一提的是 mentor 小哥 Ganesh 对于时序数据库非常的了解，为 Prometheus 和 TSDB 贡献了多个大 feature，如果有他做 mentor 的话应该还是能学到不少东西的。&lt;/p>
+&lt;p>参考 issue:&lt;br>
+&lt;a href="https://github.com/prometheus/prometheus/issues/535">bulk input&lt;/a>、
+&lt;a href="https://github.com/prometheus/tsdb/pull/370">vertical querier&lt;/a>&lt;/p>
+&lt;h1 id="linkerd2">Linkerd2&lt;/h1>
+&lt;p>Linkerd2 是一种 ServiceMesh，项目原生就提供了狂拽酷炫吊炸天的 Prometheus 和 Grafana 集成。&lt;/p>
+&lt;p>&lt;img src="http://yeya24.github.io/img/gsoc-2019/linkerd-web.png" alt="linkerd-web">&lt;/p>
+&lt;p>&lt;img src="http://yeya24.github.io/img/gsoc-2019/linkerd-grafana.png" alt="linkerd-Grafana">&lt;/p>
+&lt;h2 id="alertmanager-integration">Alertmanager Integration&lt;/h2>
+&lt;ul>
+&lt;li>导师: Thomas Rampelberg (@grampelberg)&lt;/li>
+&lt;li>技能: Go, Prometheus, Grafana, Kubernetes&lt;/li>
+&lt;/ul>
+&lt;p>Linkerd 目前虽然已经集成了 Prometheus 和 Grafana，但目前并没有配置默认的告警规则，当然也没有使用 Alertmanager。这个 idea 主要是基于 Alertmanager 为 linkerd 实现开箱即用的告警能力。具体要求如下：&lt;/p>
+&lt;ul>
+&lt;li>Alertmanager 作为一个安装时的可选项。&lt;/li>
+&lt;li>为控制平面设置默认的告警规则。&lt;/li>
+&lt;li>使用者能够很轻松的配置告警的发送。提到的告警方式包括 slack 和 email，这两个都是 Alertmanager　原生支持的。&lt;/li>
+&lt;li>通过 linkerd 中的 ServiceProfile(Linkerd 中的一种 CRD) 来支持对某服务配置告警规则。&lt;/li>
+&lt;/ul>
+&lt;p>整体来说难度也不大，比较有趣。如果本身对 ServiceMesh 比较感兴趣的同学可以考虑参加。&lt;/p>
+&lt;h1 id="cortex">Cortex&lt;/h1>
+&lt;p>Cortex 是基于 Prometheus 进行扩展的一个项目，地址在&lt;a href="https://github.com/cortexproject/cortex">cortexproject/cortex&lt;/a>。在之前两届的 PromCon 中都对这个项目有所介绍，目前也成为了 cncf 的沙箱项目。Cortex 的主要目的是实现支持多租户、可水平扩展的 Prometheus，另外它也提供 metrics 的长期存储。Cortex 一直以来都运行于 Grafana Cloud 和 Weave Cloud 中，为用户提供一种 Prometheus-as-a-Service 的服务。在Weave Cloud 中有一个叫做 Prometheus-book 的东东，听起来跟 Jupyter-Notebook 差不多，功能上确实类似。它给每个用户提供了一个 Prometheus 的界面，每个租户的 metrics 数据都是独立的，用户可以在 Prometheus-book 中查询自己的 metrics。既然是这样自然需要租户间数据隔离以及数据长期存储，提供这种能力的就是 Cortex。Cortex 项目目前贡献者不多，如果觉得 Prometheus 项目贡献的门槛比较高，竞争比较激烈（三哥们实在是太猛了），可以考虑参加这个项目。&lt;/p>
+&lt;p>另外由于对 Cortex 相关的代码实现还没怎么看完，所以下面部分内容是凭着官方的架构、文档以及一些 issue 里面的讨论写的，有错误请指正。&lt;/p>
+&lt;h2 id="improve-ingester-handover">Improve Ingester Handover&lt;/h2>
+&lt;ul>
+&lt;li>导师: Bryan Boreham (@bboreham)&lt;/li>
+&lt;li>技能: Go&lt;/li>
+&lt;/ul>
+&lt;p>&lt;img src="https://github.com/cortexproject/cortex/blob/master/docs/architecture.png?raw=true" alt="Architecture">&lt;/p>
+&lt;p>在 Cortex 目前的架构中，大部分的组件都是无状态的，除了 Ingestor 是有状态的（里面需要保存一定时间内的 Prometheus 的 metrics）。Prometheus 通过 remote write API 向 Cortex 写数据，数据点通过 Distributor 分发到 Ingester，具体的分发方式使用的是 DHT（分布式哈希表）。当前的实现中，Distributor 里面保存的 IngesterPool 仅仅允许每12小时伸缩1个Ingestor，可扩展性方面问题比较大。至于为什么是12小时是因为 Ingester 会一直保存12个小时 Prometheus 的 metrics，如果出现相同的 series 就对它们进行压缩，12小时到了再刷到后端的对象存储中去，这样子做的话比较不好应对流量负载动态变化的情况。&lt;/p>
+&lt;p>总结一下这个 idea 就是对 Distributor 接收到数据分发 -&amp;gt; Ingester 处理 -&amp;gt; 一定时间刷到对象存储里面去，这一整个流程进行优化或者重构使这个架构变得易于扩展。值得一提的是，同样是 Grafana 的 loki 在这部分的架构似乎和 Cortex 一致，如果你完成了这边的 issue，也可以去给 loki 提 PR 了：）。&lt;/p>
+&lt;h2 id="centralized-rate-limiting">Centralized Rate Limiting&lt;/h2>
+&lt;ul>
+&lt;li>导师: Bryan Boreham (@bboreham)&lt;/li>
+&lt;li>技能: Go&lt;/li>
+&lt;/ul>
+&lt;p>Cortex 是一个典型的微服务架构，每个组件各自都实现了限流。不过当需要用户对distributor/ingester 进行扩展时，就会受到限制（？这里没怎么看懂）。最好能够实现全局的限流能力，这样同样也能简化配置。参考链接在：&lt;a href="https://github.com/cortexproject/cortex/issues/1090">issues/1090&lt;/a>。在链接中还提到了 youtube 开源的 doorman，doorman 通过后端的一致性存储来实现全局的限流。相关的内容我不是很了解，感兴趣的同学可以自行参考。&lt;/p>
+&lt;h2 id="use-etcd-in-cortex">Use etcd in Cortex&lt;/h2>
+&lt;ul>
+&lt;li>导师: Bryan Boreham (@bboreham)&lt;/li>
+&lt;li>技能: Go&lt;/li>
+&lt;/ul>
+&lt;p>当前的 Cortex 中使用 consul 存储一些集群的状态信息，包括 ruler、ingester、querier 等组件都需要去查询 consul 中的信息。这个 idea 的主要任务是为存储状态提供可选的 etcd 支持，相对来说比较容易。另外在 Cortex 的 issue 中我也看到有人提议支持 tikv，如果时间充裕也可以一起实现了 ：）。&lt;/p>
+&lt;h1 id="联系作者">联系作者&lt;/h1>
+&lt;p>由于本人水平有限，有错误欢迎大家指出。如果你对于今年的这些项目或是对于 Prometheus 或是 Kubernetes 感兴趣，或者是你觉得这篇文章对你有帮助，你都可以联系我。我的微信是 eWJfeGExNAo=，你也可以在 &lt;a href="https://github.com/yeya24">Github&lt;/a> 上找到我。&lt;/p></description></item><item><title>influxdb的高可用方案</title><link>http://yeya24.github.io/post/influxdb_ha/</link><pubDate>Sat, 02 Mar 2019 22:32:12 +0800</pubDate><guid>http://yeya24.github.io/post/influxdb_ha/</guid><description>&lt;p>由于目前influxdb本身的集群方案属于闭源状态，而本身的influxdb并不支持集群。在目前的社区中出现的方案主要有两种：&lt;/p>
+&lt;ul>
+&lt;li>influxdb-relay　这是官方提供的高可用方案，已经有２年没有更新了，目前有一个官方的fork还在活跃&lt;/li>
+&lt;li>influx-proxy　饿了吗的开源的方案，大概是在influxdb-relay的基础上进行了修改&lt;/li>
+&lt;/ul>
+&lt;h2 id="influxdb-relay">influxdb-relay&lt;/h2>
+&lt;p>这里主要讲一下目前活跃的relay的fork，github地址在&lt;a href="https://github.com/vente-privee/influxdb-relay">influxdb-relay&lt;/a>&lt;/p>
+&lt;p>&lt;a href="https://imgchr.com/i/kqtEdI">&lt;img src="https://s2.ax1x.com/2019/03/02/kqtEdI.png" alt="kqtEdI.png">&lt;/a>&lt;/p>
+&lt;p>fork版本的relay与原版功能比较类似，对外是一个httpserver，收到写请求后能够支持通过http或者udp方式向influxdb写入数据，并且也可以支持prometheus的远程写入(http)。不过不足的是，relay并不支持influxdb的查询接口，也不支持prometheus的远程读。&lt;/p>
+&lt;p>当数据写入的请求到达relay这一层，relay会对自己配置的后端的influxdb发起写请求，不过这里并没有能够解决数据一致性的问题。如果写入influxdb时失败，则只会简单的返回一个错误信息，写入失败的数据就在这一个influxdb中丢失了。&lt;/p>
+&lt;h2 id="influx-proxy">influx-proxy&lt;/h2>
+&lt;p>influx-proxy 是饿了吗开源的方案。github地址在&lt;a href="https://github.com/shell909090/influx-proxy">influx-proxy&lt;/a>。&lt;/p>
+&lt;p>&lt;a href="https://imgchr.com/i/kqtAeA">&lt;img src="https://s2.ax1x.com/2019/03/02/kqtAeA.png" alt="kqtAeA.png">&lt;/a>&lt;/p>
+&lt;p>上面是proxy给出的一个架构图。可以看出proxy组件同时支持外面的查询和写入请求。当proxy收到数据向influxdb写入只支持http的方式。在proxy和influxdb中间多了一个中间层，在这个中间层可以对写入数据进行分片。在配置文件中，可以针对不同的measurement（在prometheus中称为metric），配置它们发送到特定的后端influxdb。&lt;/p>
+&lt;p>proxy的架构中包含了redis。一开始以为redis是用来解决relay中没有解决的数据一致性的问题，当写入失败之后，将数据存入redis缓存，后面再写，后面发现proxy并没有这么使用redis。redis在其中的作用仅仅是存储proxy的配置信息，包括存储分片配置，influxdb后端的地址、使用的数据库、超时时间等等。proxy也提供了一个 reload 的热加载的接口，热加载时会去读取redis中的配置然后重新启动后端服务，redis只是用来干这件事情的。如果只是用于加载配置，不知道为什么不采用简单的文件方式而要使用redis。&lt;/p>
+&lt;p>proxy的写入的过程中，解决了之前relay的写入一致性问题。在proxy启动之后，读取配置中后端的influxdb，并为每一个后端生成一个数据文件和一个元数据文件。当通过http接口写入数据时，proxy会向符合分片配置的所有influxdb实例进行写入，如果向某个db写入成功，则返回；若失败，则将需要写入的数据写到该db对应的数据文件中。&lt;/p>
+&lt;p>有另外一个goroutine会去查看数据文件，发现数据文件中有数据，则会再对该influxdb尝试写入。如果此次写入成功，则删除刚刚写进去的这条数据。如果写入失败，则对数据文件进行回滚操作。具体的回滚操作需要用到元数据文件，在每次后台的goroutine发现数据文件有文件需要写入前，会将本次要写入的数据先写进元数据文件，之后尝试写influxdb，若失败，则将数据文件里的文件偏移(offset)回复到之前的位置(根据元数据文件里的信息判断长度)。&lt;/p>
+&lt;p>不过很奇怪的一点是，上面所说的这个后台goroutine只有在加载配置的时候才会启动一次，运行完就结束。加载配置只有在proxy启动或者调用reload接口时运行，而不是一直在后台运行，这一点真的让人很难理解。此外，采用文件来保存写入失败的数据的这一做法会消耗大量的磁盘io，性能受到比较大的影响，还需要承受文件系统损坏的风险。&lt;/p></description></item><item><title>P4语言介绍</title><link>http://yeya24.github.io/post/p4/</link><pubDate>Mon, 25 Feb 2019 10:24:05 +0800</pubDate><guid>http://yeya24.github.io/post/p4/</guid><description>&lt;p>前言：这篇文章参考自SDNLAB上zenhox的&lt;a href="https://www.sdnlab.com/22466.html">P4编程理论与实践——理论篇&lt;/a>，以及杨泽卫、李呈老师的&amp;laquo;重构网络与SDN&amp;raquo;一书，在这里对他们表示能写出非常高质量的SDN文章也表示衷心的感谢。&lt;/p>
+&lt;p>在SDN中，一个重要的概念就是数据平面和控制平面的分离。控制平面就是我们常说的控制器，如果采用openflow协议，数据平面就是支持openflow的交换机。控制平面与数据平面之间仅能通过openflow协议进行通讯。openflow协议有以下的特点：&lt;/p>
+&lt;ul>
+&lt;li>预先定义好的控制器与数据平面设备之间通信的报文格式&lt;/li>
+&lt;li>openflow是一种狭义的南向协议，是协议相关的，数据平面和控制平面都需要实现该协议。&lt;/li>
+&lt;/ul>
+&lt;p>虽然openflow为SDN奠定了基础，但在实际开发中，openflow还存在着比较大的局限。它无法做到协议不相关，由于必须遵循openflow协议来进行编程，而无法根据自己的需要进行额外扩展，很不灵活。openflow只能在已经固化的交换机数据处理逻辑上，通过流表、组表等指导数据流处理，却无法重新定义交换机处理数据的逻辑。此外，在openflow的版本迭代速度比较快，字段的变化也非常多。在openflow 1.0版本中仅支持12个匹配字段，1.3版本中支持40个匹配字段，到了1.5版本则可以支持45个匹配字段。随着版本的更迭需要对字段进行更改，如果是软件层面的控制器可以比较方便的修改，但是对于数据平面，特别是支持openflow的硬件交换机来说，每次修改协议都需要重新编写数据包的处理逻辑。可以说，openflow的这种可扩展性非常差的设计大大阻碍了openflow的推广和使用。&lt;/p>
+&lt;h2 id="数据平面可编程与p4">数据平面可编程与P4&lt;/h2>
+&lt;p>既然之前提到了openflow的弊端，虽然实现了控制平面的可编程，但在数据平面仍然是使用固定的openflow。于是，最好能够有一种方式能够做到协议无关，从而在数据平面能够自己定义数据包的处理逻辑。于是，P4语言应运而生。&lt;/p>
+&lt;p>P4是一种协议无关的数据包处理编程语言，P4支持用户自定义匹配字段，协议解析过程和转发过程，从而能实现真正意义上的协议无关可编程网络数据平面。&lt;/p>
+&lt;p>不过，P4与openflow的定位完全不同。openflow是一种南向协议，它是控制平面与数据平面沟通的桥梁。而P4则是一门数据平面的编程语言，它关注的是数据平面的开放性，并不涉及到控制平面。&lt;/p>
+&lt;h2 id="p4的抽象转发模型">P4的抽象转发模型&lt;/h2>
+&lt;p>&lt;img src="https://img1.sdnlab.com/wp-content/uploads/2018/10/v1Model.png" alt="V1Model">&lt;/p>
+&lt;p>这是P4所提供的最简单易理解的编程结构，V1Model。从图上可以看出，数据包的处理过程像一条流水线一样，它由5个模块组成，分别是：&lt;/p>
+&lt;ol>
+&lt;li>Parser：解析器，对数据包根据预先定义好的格式进行解析，并提取头部的各个字段，在这里可能会根据不同的头部进行匹配。比如如果三层包头的协议字段是0x0800则是ip报文，如果是0x0806则是arp报文，则会进行不同的处理。&lt;/li>
+&lt;li>Ingress：Ingress流水线部分，数据处理逻辑的入口。&lt;/li>
+&lt;li>TM：Traffic Manager，在这里定义核心的处理逻辑，并且会对一些元数据进行更新。&lt;/li>
+&lt;li>Egress：Egress流水线部分，数据处理逻辑的出口。&lt;/li>
+&lt;li>Deparser：用于对数据包进行重组，因为数据包在处理过程中经历了分解和处理。所以最后转发的时候需要重组一下。&lt;/li>
+&lt;/ol>
+&lt;p>P4为我们提供了上述抽象，我们就可以把所有的交换机的内部处理逻辑理解为上述的模型，每次数据包进入交换机，都会通过这些一条流水线。你要做的只是去定义流水线上的各个模块罢了。所以，按照上述模型，P4语言的代码结构如下:&lt;/p>
+&lt;pre>&lt;code>#include &amp;lt;core.p4&amp;gt;
+#include &amp;lt;v1model.p4&amp;gt;
+const bit&amp;lt;16&amp;gt; TYPE_IPV4 = 0x800;
+/*************************************************************************
+*********************** H E A D E R S ***********************************
+*************************************************************************/
+typedef bit&amp;lt;9&amp;gt; egressSpec_t;
+typedef bit&amp;lt;48&amp;gt; macAddr_t;
+typedef bit&amp;lt;32&amp;gt; ip4Addr_t;
+/*定义二层数据包头*/
+header ethernet_t {
+macAddr_t dstAddr;
+macAddr_t srcAddr;
+bit&amp;lt;16&amp;gt; etherType;
+}
+/*定义ip数据包头*/
+header ipv4_t {
+bit&amp;lt;4&amp;gt; version;
+bit&amp;lt;4&amp;gt; ihl;
+bit&amp;lt;8&amp;gt; diffserv;
+bit&amp;lt;16&amp;gt; totalLen;
+bit&amp;lt;16&amp;gt; identification;
+bit&amp;lt;3&amp;gt; flags;
+bit&amp;lt;13&amp;gt; fragOffset;
+bit&amp;lt;8&amp;gt; ttl;
+bit&amp;lt;8&amp;gt; protocol;
+bit&amp;lt;16&amp;gt; hdrChecksum;
+ip4Addr_t srcAddr;
+ip4Addr_t dstAddr;
+}
+struct metadata {
+/* empty */
+}
+/*定义了headers由二层头部与三层头部组成*/
+struct headers {
+ethernet_t ethernet;
+ipv4_t ipv4;
+}
+/*************************************************************************
+*********************** P A R S E R ***********************************
+*************************************************************************/
+parser MyParser(packet_in packet,
+out headers hdr,
+inout metadata meta,
+inout standard_metadata_t standard_metadata) {
+state start {
+transition parse_ethernet; //转移到 parse_ethernet状态
+}
+state parse_ethernet {
+packet.extract(hdr.ethernet); //提取数据包头
+transition select(hdr.ethernet.etherType) {
+TYPE_IPV4: parse_ipv4; //转移到 parse_ipv4状态
+default: accept;
+}
+}
+state parse_ipv4 {
+packet.extract(hdr.ipv4);
+transition accept; //根据 etherType, 转移到其他状态，直到转移到accept结束
+}
+}
+/*************************************************************************
+************ C H E C K S U M V E R I F I C A T I O N *************
+*************************************************************************/
+/*校验和的计算可以空着*/
+control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
+apply { }
+}
+/*************************************************************************
+************** I N G R E S S P R O C E S S I N G *******************
+*************************************************************************/
+control MyIngress(inout headers hdr,
+inout metadata meta,
+inout standard_metadata_t standard_metadata) {
+/*定义了丢包的动作*/
+action drop() {
+mark_to_drop();
+}
+/*定义了三层转发的动作*/
+action ipv4_forward(macAddr_t dstAddr, egressSpec_t port) {
+standard_metadata.egress_spec = port;
+hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
+hdr.ethernet.dstAddr = dstAddr;
+hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
+}
+/*定义table ipv4_lpm*/
+table ipv4_lpm {
+key = {
+hdr.ipv4.dstAddr: lpm;
+}
+actions = {
+ipv4_forward;
+drop;
+NoAction;
+}
+size = 1024;
+default_action = drop();
+}
+//上述都是声明定义过程，这里是真正的数据处理逻辑
+apply {
+if (hdr.ipv4.isValid()) {
+ipv4_lpm.apply();
+}
+}
+}
+/*************************************************************************
+**************** E G R E S S P R O C E S S I N G *******************
+*************************************************************************/
+control MyEgress(inout headers hdr,
+inout metadata meta,
+inout standard_metadata_t standard_metadata) {
+apply { }
+}
+/*************************************************************************
+************* C H E C K S U M C O M P U T A T I O N **************
+*************************************************************************/
+/*校验和的计算部分，可以省略*/
+control MyComputeChecksum(inout headers hdr, inout metadata meta) {
+apply {
+update_checksum(
+hdr.ipv4.isValid(),
+{ hdr.ipv4.version,
+hdr.ipv4.ihl,
+hdr.ipv4.diffserv,
+hdr.ipv4.totalLen,
+hdr.ipv4.identification,
+hdr.ipv4.flags,
+hdr.ipv4.fragOffset,
+hdr.ipv4.ttl,
+hdr.ipv4.protocol,
+hdr.ipv4.srcAddr,
+hdr.ipv4.dstAddr },
+hdr.ipv4.hdrChecksum,
+HashAlgorithm.csum16);
+}
+}
+/*************************************************************************
+*********************** D E P A R S E R *******************************
+*************************************************************************/
+/*数据包的重组阶段*/
+control MyDeparser(packet_out packet, in headers hdr) {
+apply {
+packet.emit(hdr.ethernet);
+packet.emit(hdr.ipv4);
+}
+}
+/*************************************************************************
+*********************** S W I T C H *******************************
+*************************************************************************/
+V1Switch(
+MyParser(),
+MyVerifyChecksum(),
+MyIngress(),
+MyEgress(),
+MyComputeChecksum(),
+MyDeparser()
+) main;
+&lt;/code>&lt;/pre>&lt;p>这个简单的P4语言程序定义了一个三层数据包的处理流程。该程序的主函数入口在最下方的main函数，在这里定义了一条完整的数据处理流水线。先是定义Parser，后计算校验和，再经过Ingress和Egress对数据包进行处理，之后计算校验和，再将数据包重组就完成了一次数据转发。&lt;/p>
+&lt;p>P4程序的核心部分是数据头部的定义以及Ingress中对数据包的处理。在数据头部的定义中，可以很明确看到定义了二层以太网包头以及IP包头这两种数据格式。当然如果你需要实现更加复杂的应用，你可以定义更多的数据包头例如MPLS包头，TCP包头等，甚至你也可以定义openflow的包头，从而在P4程序中实现openflow的数据平面。&lt;/p>
+&lt;p>Ingress中的数据包处理是P4的核心部分。示例程序中定义了表ipv4_lpm。在table中可以定义动作，ipv4_lpm表中的动作包括三层转发（ipv4_forward），丢包（drop）和NoAction，默认动作则是简单的丢包。ipv4_forward这个action的实现逻辑也非常清晰，首先修改元数据（metadata），将egress的端口设置为出端口。然后，将二层的源MAC地址修改为当前MAC地址，将目的MAC修改为需要发送出去的端口的MAC地址，之后将ttl减一，这个逻辑也与我们所知道的三层转发过程一致。&lt;/p>
+&lt;p>P4语言语法简单，程序结构也比较清晰，非常容易上手。一旦熟悉P4程序的工作模式，将能够非常方便的上手开发。在网上也有一些比较不错的P4学习资源，比如P4官方的示例教程，地址是&lt;a href="https://github.com/p4lang/tutorials">tutorials&lt;/a>。里面的应用包括了基于P4实现的tunnel、负载均衡、源路由、ecn等等。&lt;/p>
+&lt;p>P4语言目前仍然保持着良好的发展势头，且越来越火爆。Barefoot公司推出的基于P4语言的芯片 Tofino 已经开始逐渐在市场上使用，常见于一些复杂的云网络中。基于数据平面可编程思想的P4，正在推动着SDN领域走的越来越远。&lt;/p></description></item><item><title>Alertmanager的告警流程分析（一）</title><link>http://yeya24.github.io/post/am-1/</link><pubDate>Sun, 24 Feb 2019 15:05:50 +0800</pubDate><guid>http://yeya24.github.io/post/am-1/</guid><description>&lt;p>这篇文章会从一些源代码的角度来分析alertmanager告警的这个流程，基于版本0.16.1。由于本人水平有限，分析可能有一些不到位的地方，欢迎大家指出。由于涉及的阶段比较多，我打算分2篇写完。先上一张官方的架构图。&lt;/p>
+&lt;p>&lt;img src="https://github.com/prometheus/alertmanager/raw/master/doc/arch.svg?sanitize=true" alt="Alertmanager架构">&lt;/p>
+&lt;p>alertmanager的架构非常清晰：图中左上角的API层包括从prometheus接收到告警以及silence的增删改查。接收到alert和silence之后，各自保存在一个provider对象中存储起来。后续，真正的告警流程由Dispatcher对象来进行处理。Dispatcher对象面会对告警进行分组和聚合，然后每一个告警组（Group）会依次执行Notification Pipeline，这就是基本的告警流程。&lt;/p>
+&lt;h2 id="dispatcher">Dispatcher&lt;/h2>
+&lt;p>Dispatcher对象是告警流程的执行者，在main中调用NewDispatcher初始化&lt;/p>
+&lt;pre>&lt;code>disp = dispatch.NewDispatcher(alerts, dispatch.NewRoute(conf.Route, nil), pipeline, marker, timeoutFunc, logger)
+&lt;/code>&lt;/pre>&lt;p>下面是Dispatcher结构体的主要定义&lt;/p>
+&lt;pre>&lt;code>type Dispatcher struct {
+route *Route
+alerts provider.Alerts
+stage notify.Stage
+marker types.Marker
+timeout func(time.Duration) time.Duration
+aggrGroups map[*Route]map[model.Fingerprint]*aggrGroup
+mtx sync.RWMutex
+done chan struct{}
+ctx context.Context
+cancel func()
+logger log.Logger
+}
+&lt;/code>&lt;/pre>&lt;p>结构体中，首先是route。route是路由信息，在alertmanager的配置中配置，当收到告警后，匹配路由（其实也就是匹配label），然后执行指定的操作。接下来是alerts。alerts是alertmanager中待发送的告警信息store，prometheus发出的告警就是进入这个store保存下来，然后在Dispatcher中被消费。stage是一个接口，主要实现了exec方法，即流水线的执行动作。在Dispatcher中使用的stage结构是pipelines，pipelines里面包含了多个阶段，也就是架构图右侧的notification pipelines。其次是marker接口，marker接口实现了以下方法，相当于它是一个告警的处理者的抽象，对告警状态进行更新。后面是aggrGroups，在alertmanager中有对告警根据labels进行分组的概念，这就是保存每个组每条告警的map缓存。&lt;/p>
+&lt;pre>&lt;code>type Marker interface {
+SetActive(alert model.Fingerprint)
+SetInhibited(alert model.Fingerprint, ids ...string)
+SetSilenced(alert model.Fingerprint, ids ...string)
+Count(...AlertState) int
+Status(model.Fingerprint) AlertStatus
+Delete(model.Fingerprint)
+Unprocessed(model.Fingerprint) bool
+Active(model.Fingerprint) bool
+Silenced(model.Fingerprint) ([]string, bool)
+Inhibited(model.Fingerprint) ([]string, bool)
+}
+&lt;/code>&lt;/pre>&lt;p>下面看下Dispatcher的 run 方法&lt;/p>
+&lt;pre>&lt;code>func (d *Dispatcher) run(it provider.AlertIterator) {
+cleanup := time.NewTicker(30 * time.Second)
+defer cleanup.Stop()
+defer it.Close()
+for {
+select {
+case alert, ok := &amp;lt;-it.Next():
+if !ok {
+// Iterator exhausted for some reason.
+if err := it.Err(); err != nil {
+level.Error(d.logger).Log(&amp;quot;msg&amp;quot;, &amp;quot;Error on alert update&amp;quot;, &amp;quot;err&amp;quot;, err)
+}
+return
+}
+level.Debug(d.logger).Log(&amp;quot;msg&amp;quot;, &amp;quot;Received alert&amp;quot;, &amp;quot;alert&amp;quot;, alert)
+// Log errors but keep trying.
+if err := it.Err(); err != nil {
+level.Error(d.logger).Log(&amp;quot;msg&amp;quot;, &amp;quot;Error on alert update&amp;quot;, &amp;quot;err&amp;quot;, err)
+continue
+}
+for _, r := range d.route.Match(alert.Labels) {
+d.processAlert(alert, r)
+}
+case &amp;lt;-cleanup.C:
+d.mtx.Lock()
+for _, groups := range d.aggrGroups {
+for _, ag := range groups {
+if ag.empty() {
+ag.stop()
+delete(groups, ag.fingerprint())
+}
+}
+}
+d.mtx.Unlock()
+case &amp;lt;-d.ctx.Done():
+return
+}
+}
+}
+&lt;/code>&lt;/pre>&lt;p>it对象是一个alerts的迭代器，它的Next()方法是一个channel，从里面消费到alert。整个run方法的核心逻辑很简单，从it.Next()这个channel里面消费到alert之后，查看是否与所配置的路由匹配，如果匹配的话，进入alert的处理方法processAlert。&lt;/p>
+&lt;pre>&lt;code>func (d *Dispatcher) processAlert(alert *types.Alert, route *Route) {
+groupLabels := getGroupLabels(alert, route)
+fp := groupLabels.Fingerprint()
+d.mtx.Lock()
+defer d.mtx.Unlock()
+group, ok := d.aggrGroups[route]
+if !ok {
+group = map[model.Fingerprint]*aggrGroup{}
+d.aggrGroups[route] = group
+}
+// If the group does not exist, create it.
+ag, ok := group[fp]
+if !ok {
+ag = newAggrGroup(d.ctx, groupLabels, route, d.timeout, d.logger)
+group[fp] = ag
+go ag.run(func(ctx context.Context, alerts ...*types.Alert) bool {
+_, _, err := d.stage.Exec(ctx, d.logger, alerts...)
+if err != nil {
+level.Error(d.logger).Log(&amp;quot;msg&amp;quot;, &amp;quot;Notify for alerts failed&amp;quot;, &amp;quot;num_alerts&amp;quot;, len(alerts), &amp;quot;err&amp;quot;, err)
+}
+return err == nil
+})
+}
+ag.insert(alert)
+}
+&lt;/code>&lt;/pre>&lt;p>这个方法的逻辑也是非常的清楚。在这里就是先拿出groupLabel，查看这个labels的hash是否存在，不存在则新建一个aggrGroup。接下来，执行stage的Exec方法。至此，Dispatcher的处理流程结束，已经进入了notification pipelines的阶段。&lt;/p>
+&lt;h2 id="pipelines">pipelines&lt;/h2>
+&lt;p>先看看pipelines的创建，pipelines就是RoutingStage对象，RoutingStage是一个map，它的key是每一个receiver的名字，value是一个multistage对象。在每个multistage中，可以看到都会包括这么几个阶段，GossipSettleStage、InhibitStage、SilenceStage，后面的阶段由createStage函数创建，createStage返回一个FanoutStage，FanoutStage中为每一个receiver都创建了WaitStage、DedupStage、RetryStage、SetNotifierStage，可以 发现这都和上面的架构图是一一对应的。&lt;/p>
+&lt;pre>&lt;code>func BuildPipeline(
+confs []*config.Receiver,
+tmpl *template.Template,
+wait func() time.Duration,
+muter types.Muter,
+silences *silence.Silences,
+notificationLog NotificationL执行时都会跑一个Goroutine。og,
+marker types.Marker,
+peer *cluster.Peer,
+logger log.Logger,
+) RoutingStage {
+rs := RoutingStage{}
+ms := NewGossipSettleStage(peer)
+is := NewInhibitStage(muter)
+ss := NewSilenceStage(silences, marker)
+for _, rc := range confs {
+rs[rc.Name] = MultiStage{ms, is, ss, createStage(rc, tmpl, wait, notificationLog, logger)}
+}
+return rs
+}
+func createStage(rc *config.Receiver, tmpl *template.Template, wait func() time.Duration, notificationLog NotificationLog, logger log.Logger) Stage {
+var fs FanoutStage
+for _, i := range BuildReceiverIntegrations(rc, tmpl, logger) {
+recv := &amp;amp;nflogpb.Receiver{
+GroupName: rc.Name,
+Integration: i.name,
+Idx: uint32(i.idx),
+}
+var s MultiStage
+s = append(s, NewWaitStage(wait))
+s = append(s, NewDedupStage(i, notificationLog, recv))
+s = append(s, NewRetryStage(i, rc.Name))
+s = append(s, NewSetNotifiesStage(notificationLog, recv))
+fs = append(fs, s)
+}
+return fs
+}
+&lt;/code>&lt;/pre>&lt;p>所有的小阶段都被包装在MultiStage和FanoutStage中，先来看看它们的exec方法是怎么实现的。在MultiStage中，exec很简单，遍历自身的Stage，依次执行每个阶段各自的exec方法，根据之前所说pipelines中的MultiStage中，保存了4个阶段，GossipSettle、Inhibit、Silence、FanoutStage，这四个阶段会依次调用exec方法。后面看看FanoutStage，它的类型其实与MultiStage相同，不同的是它的每个阶段都是通过一个Goroutine来执行。其实也比较好理解，GossipSettle、Inhibit、Silence这几个阶段属于发送前的准备工作，开启Gossip，禁止某些警报以及沉默某些警报，后面的几个阶段才是真正发送警报的流程。包括了Wait、Dedup、Retry以及SetNotify。&lt;/p>
+&lt;pre>&lt;code>type MultiStage []Stage
+func (ms MultiStage) Exec(ctx context.Context, l log.Logger, alerts ...*types.Alert) (context.Context, []*types.Alert, error) {
+var err error
+for _, s := range ms {
+if len(alerts) == 0 {
+return ctx, nil, nil
+}
+ctx, alerts, err = s.Exec(ctx, l, alerts...)
+if err != nil {
+return ctx, nil, err
+}
+}
+return ctx, alerts, nil
+}
+type FanoutStage []Stage
+func (fs FanoutStage) Exec(ctx context.Context, l log.Logger, alerts ...*types.Alert) (context.Context, []*types.Alert, error) {
+var (
+wg sync.WaitGroup
+me types.MultiError
+)
+wg.Add(len(fs))
+for _, s := range fs {
+go func(s Stage) {
+if _, _, err := s.Exec(ctx, l, alerts...); err != nil {
+me.Add(err)
+level.Error(l).Log(&amp;quot;msg&amp;quot;, &amp;quot;Error on notify&amp;quot;, &amp;quot;err&amp;quot;, err)
+}
+wg.Done()
+}(s)
+}
+wg.Wait()
+if me.Len() &amp;gt; 0 {
+return ctx, alerts, &amp;amp;me
+}
+return ctx, alerts, nil
+}
+&lt;/code>&lt;/pre>&lt;h2 id="gossipsettlestage">GossipSettleStage&lt;/h2>
+&lt;p>GossipSettle是第一个阶段，很简单，这个阶段的主要作用就是执行 n.peer.WaitReady方法，这个方法与alertmanager的高可用有关，对于每一个peer有一个readyChannel，当某一个peer处于unReady状态，就一直阻塞，ready之后就进入下一个阶段&lt;/p>
+&lt;pre>&lt;code>type GossipSettleStage struct {
+peer *cluster.Peer
+}
+func NewGossipSettleStage(p *cluster.Peer) *GossipSettleStage {
+return &amp;amp;GossipSettleStage{peer: p}
+}
+func (n *GossipSettleStage) Exec(ctx context.Context, l log.Logger, alerts ...*types.Alert) (context.Context, []*types.Alert, error) {
+if n.peer != nil {
+n.peer.WaitReady()
+}
+return ctx, alerts, nil
+}
+&lt;/code>&lt;/pre>&lt;h2 id="inhibitstage">InhibitStage&lt;/h2>
+&lt;p>下一个阶段是InhibitStage，顾名思义，对告警执行抑制。抑制在alertmanager中的配置文件中配置，满足某些label的条件则抑制该告警。下面的实现中是对alerts进行遍历，如果不满足抑制的匹配规则，则加入filtered ，进入下一个阶段；而匹配上的相当于被丢弃，不被处理&lt;/p>
+&lt;pre>&lt;code>// InhibitStage filters alerts through an inhibition muter.
+type InhibitStage struct {
+muter types.Muter
+}
+func NewInhibitStage(m types.Muter) *InhibitStage {
+return &amp;amp;InhibitStage{muter: m}
+}
+func (n *InhibitStage) Exec(ctx context.Context, l log.Logger, alerts ...*types.Alert) (context.Context, []*types.Alert, error) {
+var filtered []*types.Alert
+for _, a := range alerts {
+if !n.muter.Mutes(a.Labels) {
+filtered = append(filtered, a)
+}
+}
+return ctx, filtered, nil
+}
+&lt;/code>&lt;/pre>&lt;h3 id="silencestage">SilenceStage&lt;/h3>
+&lt;p>Silence阶段是判断是否需要对告警执行静默处理。silence这个东西比较复杂，与inhibit不同，inhibit是在alertmanager中的配置文件进行配置，在3个AM组成的集群中，是允许不同的AM有不同的inhibit配置。而silence则是通过AM的API进行创建删除。在高可用的情况下，总不能某个AM的某条告警被silence掉了，而另外两个AM由于本身没有创建silence，就把告警发送出去了，这就无法起到高可用的作用。所以silence信息一样会通过gossip的消息在AM集群之间进行同步。由于gossip是一个最终一致性协议，所以肯定在中间会出现数据一致性的问题，让我们看看在发送silence的时候是怎么处理的。&lt;/p>
+&lt;pre>&lt;code>// SilenceStage filters alerts through a silence muter.
+type SilenceStage struct {
+silences *silence.Silences
+marker types.Marker
+}
+func NewSilenceStage(s *silence.Silences, mk types.Marker) *SilenceStage {
+return &amp;amp;SilenceStage{
+silences: s,
+marker: mk,
+}
+}
+func (n *SilenceStage) Exec(ctx context.Context, l log.Logger, alerts ...*types.Alert) (context.Context, []*types.Alert, error) {
+var filtered []*types.Alert
+for _, a := range alerts {
+sils, err := n.silences.Query(
+silence.QState(types.SilenceStateActive),
+silence.QMatches(a.Labels),
+)
+if err != nil {
+level.Error(l).Log(&amp;quot;msg&amp;quot;, &amp;quot;Querying silences failed&amp;quot;, &amp;quot;err&amp;quot;, err)
+}
+if len(sils) == 0 {
+filtered = append(filtered, a)
+n.marker.SetSilenced(a.Labels.Fingerprint())
+} else {
+ids := make([]string, len(sils))
+for i, s := range sils {
+ids[i] = s.Id
+}
+n.marker.SetSilenced(a.Labels.Fingerprint(), ids...)
+}
+}
+return ctx, filtered, nil
+}
+&lt;/code>&lt;/pre>&lt;p>首先遍历所有的alerts，根据每条告警，查询silences的store中是否有目前状态是active（即没有过期的），且labels与该告警匹配的silence，如果有，那么通过marker的SetSilenced方法将指定labels的告警设置为silenced状态。方法的关键就在于silences的查询过程，那就看看silences.Query这个方法&lt;/p>
+&lt;pre>&lt;code>func (s *Silences) Query(params ...QueryParam) ([]*pb.Silence, error) {
+start := time.Now()
+s.metrics.queriesTotal.Inc()
+sils, err := func() ([]*pb.Silence, error) {
+q := &amp;amp;query{}
+for _, p := range params {
+if err := p(q); err != nil {
+return nil, err
+}
+}
+return s.query(q, s.now())
+}()
+if err != nil {
+s.metrics.queryErrorsTotal.Inc()
+}
+s.metrics.queryDuration.Observe(time.Since(start).Seconds())
+return sils, err
+}
+func (s *Silences) query(q *query, now time.Time) ([]*pb.Silence, error) {
+// If we have an ID constraint, all silences are our base set.
+// This and the use of post-filter functions is the
+// the trivial solution for now.
+var res []*pb.Silence
+s.mtx.Lock()
+defer s.mtx.Unlock()
+if q.ids != nil {
+for _, id := range q.ids {
+if s, ok := s.st[id]; ok {
+res = append(res, s.Silence)
+}
+}
+} else {
+for _, sil := range s.st {
+res = append(res, sil.Silence)
+}
+}
+var resf []*pb.Silence
+for _, sil := range res {
+remove := false
+for _, f := range q.filters {
+ok, err := f(sil, s, now)
+if err != nil {
+return nil, err
+}
+if !ok {
+remove = true
+break
+}
+}
+if !remove {
+resf = append(resf, cloneSilence(sil))
+}
+}
+return resf, nil
+}
+&lt;/code>&lt;/pre>&lt;p>这两个方法比较长，silences.Query这个方法实际调用的是query方法，所以我们直接看query方法。query方法中，首先看参数的query里面有没有带上id限制，如果有指定id，就从s.st这个保存了当前所有silence的map找出指定id的silence。如果没有指定，则将map里面的所有silence加入res这个切片中，在这个方法中肯定是没有指定id，所以会先得到所有的silence。之后对res这个切片进行遍历，执行filter进行过滤。所谓的过滤即是比较之前调用Query时候指定的两个参数：状态为active，且能匹配上警报的标签。通过filter过滤，如果不满足，则remove标志为true，并break退出；如果一直都满足，则将这个silence对象加入到resf这个切片中，返回回去。可以看出，在上述silence的查询过程中，是有可能出现多个AM实例中silence状态不同的情况的，可能会出现数据一致性问题。&lt;/p>
+&lt;pre>&lt;code>sils, err := n.silences.Query(
+silence.QState(types.SilenceStateActive),
+silence.QMatches(a.Labels),
+)
+&lt;/code>&lt;/pre></description></item><item><title>About</title><link>http://yeya24.github.io/about/</link><pubDate>Sun, 11 Nov 2018 16:42:45 +0800</pubDate><guid>http://yeya24.github.io/about/</guid><description>&lt;p>大学生一枚~&lt;/p></description></item><item><title>Iptables学习与记录</title><link>http://yeya24.github.io/post/iptables-study/</link><pubDate>Sun, 11 Nov 2018 16:30:03 +0800</pubDate><guid>http://yeya24.github.io/post/iptables-study/</guid><description>&lt;h2 id="iptables学习与记录">iptables学习与记录&lt;/h2>
+&lt;ol>
+&lt;li>列出表中的规则&lt;/li>
+&lt;/ol>
+&lt;pre>&lt;code>iptables -L
+&lt;/code>&lt;/pre>&lt;p>等同于 iptables &amp;ndash;list 列出指定table的所有规则，如果不使用-t 参数指定对应的表，则默认为filter表， filter表中包括 INPUT、 OUTPUT、FORWARD 三条 chain
+常用参数：&lt;/p>
+&lt;pre>&lt;code>iptables -vnL -t [表名] --line-numbers
+&lt;/code>&lt;/pre>&lt;p>表名为 nat、filter 或是 mangle 三张表中的一张，如果不填默认是filter表
+-v 代表冗余输出， 带上这个参数能够看到对应rule匹配到的数据包数量 (pkts) 以及字节数(bytes)
+-n 代表能够全部以数字的方式输出 ip 地址以及端口号， 如果不加这个参数，0.0.0.0/0 会被默认解析成 anywhere
+&amp;ndash;line-numbers 能够在打印出规则的时候展示出对应的行号&lt;/p>
+&lt;ol start="2">
+&lt;li>列出指定表的指定链的规则&lt;/li>
+&lt;/ol>
+&lt;pre>&lt;code>iptables -t [表名] -vnL [链名]
+&lt;/code>&lt;/pre>&lt;ol start="3">
+&lt;li>使用iptables-save&lt;/li>
+&lt;/ol>
+&lt;pre>&lt;code>iptables-save -t [表名]
+&lt;/code>&lt;/pre>&lt;p>使用 iptables-save 也能够查看规则， 也可以使用此命令将规则导出成一个文件&lt;/p>
+&lt;pre>&lt;code>iptables-save &amp;gt; [文件名]
+&lt;/code>&lt;/pre></description></item></channel></rss>
