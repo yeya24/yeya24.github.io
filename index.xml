@@ -50,6 +50,7 @@
 &lt;p>Store 就是一个 gRPC API 封装起来的 TSDB。Conprof 的 TSDB 是一个 fork 版本的 Prometheus TSDB。它与上游的 TSDB 基本一样，唯一的区别就是 Conprof 中存储的是 protobuf，sample 的值类型是 &lt;code>[]byte&lt;/code>, 而 Prometheus sample 的值是 &lt;code>float64&lt;/code>。这导致了 Prometheus 中的数据可以使用 &lt;a href="https://www.vldb.org/pvldb/vol8/p1816-teller.pdf">Gorilla paper&lt;/a> 中的方式对样本进行 delta-xor 压缩，而 Conprof 不行，所以在内存和磁盘使用量上目前还是会高于 Prometheus。&lt;/p>
 &lt;p>最后是 API 也就是 Query 组件。它对外暴露了类似于 Prometheus 的 API，包括 &lt;code>query&lt;/code>, &lt;code>label_names&lt;/code>, &lt;code>label_values&lt;/code>, &lt;code>series&lt;/code> 等等。另外它也包括一个非常简单的 web UI 来查询 profiles，比如下图中蓝色的小点代表了每一个 profile 的采样，单击一下就可以看到对应的 pprof UI。&lt;/p>
 &lt;p>&lt;img src="http://yeya24.github.io/img/conprof/conprof.png" alt="conprof">&lt;/p>
+&lt;p>&lt;img src="http://yeya24.github.io/img/conprof/pprof.png" alt="pprof">&lt;/p>
 &lt;p>不过目前来说这个 UI 来处于非常初级的阶段，而且暂时没办法与其他指标进行集成。如果想要将 Conprof 与 Grafana 更好的集成，可以看看这个为 Grafana 实现的 Conprof 数据源，用来在 Grafana上通过 annotations 来展示 profiles &lt;a href="https://github.com/yeya24/conprof-datasource">https://github.com/yeya24/conprof-datasource&lt;/a> 。&lt;/p>
 &lt;h2 id="未来">未来？&lt;/h2>
 &lt;h3 id="更灵活的查询">更灵活的查询&lt;/h3>
